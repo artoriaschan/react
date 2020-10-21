@@ -7,12 +7,13 @@
  * @flow
  */
 
+import type {Dispatcher as DispatcherType} from 'react-reconciler/src/ReactInternalTypes';
 import type {
   Destination,
   Chunk,
   BundlerConfig,
-  // ModuleReference,
-  // ModuleMetaData,
+  ModuleMetaData,
+  ModuleReference,
 } from './ReactFlightServerConfig';
 
 import {
@@ -24,17 +25,39 @@ import {
   close,
   processModelChunk,
   processErrorChunk,
-  // resolveModuleMetaData,
+  resolveModuleMetaData,
 } from './ReactFlightServerConfig';
 
-import {REACT_ELEMENT_TYPE} from 'shared/ReactSymbols';
+import {
+  REACT_BLOCK_TYPE,
+  REACT_ELEMENT_TYPE,
+  REACT_DEBUG_TRACING_MODE_TYPE,
+  REACT_FORWARD_REF_TYPE,
+  REACT_FRAGMENT_TYPE,
+  REACT_LAZY_TYPE,
+  REACT_LEGACY_HIDDEN_TYPE,
+  REACT_MEMO_TYPE,
+  REACT_OFFSCREEN_TYPE,
+  REACT_PROFILER_TYPE,
+  REACT_SCOPE_TYPE,
+  REACT_SERVER_BLOCK_TYPE,
+  REACT_STRICT_MODE_TYPE,
+  REACT_SUSPENSE_TYPE,
+  REACT_SUSPENSE_LIST_TYPE,
+} from 'shared/ReactSymbols';
+
+import * as React from 'react';
+import ReactSharedInternals from 'shared/ReactSharedInternals';
+import invariant from 'shared/invariant';
+
+const isArray = Array.isArray;
 
 type ReactJSONValue =
   | string
   | boolean
   | number
   | null
-  | Array<ReactModel>
+  | $ReadOnlyArray<ReactJSONValue>
   | ReactModelObject;
 
 export type ReactModel =
@@ -50,7 +73,7 @@ type ReactModelObject = {+[key: string]: ReactModel};
 
 type Segment = {
   id: number,
-  model: ReactModel,
+  query: () => ReactModel,
   ping: () => void,
 };
 
@@ -66,13 +89,15 @@ export type Request = {
   toJSON: (key: string, value: ReactModel) => ReactJSONValue,
 };
 
+const ReactCurrentDispatcher = ReactSharedInternals.ReactCurrentDispatcher;
+
 export function createRequest(
   model: ReactModel,
   destination: Destination,
   bundlerConfig: BundlerConfig,
 ): Request {
-  let pingedSegments = [];
-  let request = {
+  const pingedSegments = [];
+  const request = {
     destination,
     bundlerConfig,
     nextChunkId: 0,
@@ -81,42 +106,82 @@ export function createRequest(
     completedJSONChunks: [],
     completedErrorChunks: [],
     flowing: false,
-    toJSON: (key: string, value: ReactModel) =>
-      resolveModelToJSON(request, value),
+    toJSON: function(key: string, value: ReactModel): ReactJSONValue {
+      return resolveModelToJSON(request, this, key, value);
+    },
   };
   request.pendingChunks++;
-  let rootSegment = createSegment(request, model);
+  const rootSegment = createSegment(request, () => model);
   pingedSegments.push(rootSegment);
   return request;
 }
 
-function attemptResolveModelComponent(element: React$Element<any>): ReactModel {
-  let type = element.type;
-  let props = element.props;
+function attemptResolveElement(element: React$Element<any>): ReactModel {
+  const type = element.type;
+  const props = element.props;
+  if (element.ref !== null && element.ref !== undefined) {
+    // When the ref moves to the regular props object this will implicitly
+    // throw for functions. We could probably relax it to a DEV warning for other
+    // cases.
+    invariant(
+      false,
+      'Refs cannot be used in server components, nor passed to client components.',
+    );
+  }
   if (typeof type === 'function') {
-    // This is a nested view model.
+    // This is a server-side component.
     return type(props);
   } else if (typeof type === 'string') {
     // This is a host element. E.g. HTML.
     return [REACT_ELEMENT_TYPE, type, element.key, element.props];
-  } else {
-    throw new Error('Unsupported type.');
+  } else if (type[0] === REACT_SERVER_BLOCK_TYPE) {
+    return [REACT_ELEMENT_TYPE, type, element.key, element.props];
+  } else if (
+    type === REACT_FRAGMENT_TYPE ||
+    type === REACT_STRICT_MODE_TYPE ||
+    type === REACT_PROFILER_TYPE ||
+    type === REACT_SCOPE_TYPE ||
+    type === REACT_DEBUG_TRACING_MODE_TYPE ||
+    type === REACT_LEGACY_HIDDEN_TYPE ||
+    type === REACT_OFFSCREEN_TYPE ||
+    // TODO: These are temporary shims
+    // and we'll want a different behavior.
+    type === REACT_SUSPENSE_TYPE ||
+    type === REACT_SUSPENSE_LIST_TYPE
+  ) {
+    return element.props.children;
+  } else if (type != null && typeof type === 'object') {
+    switch (type.$$typeof) {
+      case REACT_FORWARD_REF_TYPE: {
+        const render = type.render;
+        return render(props, undefined);
+      }
+      case REACT_MEMO_TYPE: {
+        const nextChildren = React.createElement(type.type, element.props);
+        return attemptResolveElement(nextChildren);
+      }
+    }
   }
+  invariant(
+    false,
+    'Unsupported server component type: %s',
+    describeValueForErrorMessage(type),
+  );
 }
 
 function pingSegment(request: Request, segment: Segment): void {
-  let pingedSegments = request.pingedSegments;
+  const pingedSegments = request.pingedSegments;
   pingedSegments.push(segment);
   if (pingedSegments.length === 1) {
     scheduleWork(() => performWork(request));
   }
 }
 
-function createSegment(request: Request, model: ReactModel): Segment {
-  let id = request.nextChunkId++;
-  let segment = {
+function createSegment(request: Request, query: () => ReactModel): Segment {
+  const id = request.nextChunkId++;
+  const segment = {
     id,
-    model,
+    query,
     ping: () => pingSegment(request, segment),
   };
   return segment;
@@ -127,53 +192,386 @@ function serializeIDRef(id: number): string {
 }
 
 function escapeStringValue(value: string): string {
-  if (value[0] === '$') {
-    // We need to escape $ prefixed strings since we use that to encode
-    // references to IDs and as a special symbol value.
+  if (value[0] === '$' || value[0] === '@') {
+    // We need to escape $ or @ prefixed strings since we use those to encode
+    // references to IDs and as special symbol values.
     return '$' + value;
   } else {
     return value;
   }
 }
 
+function isObjectPrototype(object): boolean {
+  if (!object) {
+    return false;
+  }
+  // $FlowFixMe
+  const ObjectPrototype = Object.prototype;
+  if (object === ObjectPrototype) {
+    return true;
+  }
+  // It might be an object from a different Realm which is
+  // still just a plain simple object.
+  if (Object.getPrototypeOf(object)) {
+    return false;
+  }
+  const names = Object.getOwnPropertyNames(object);
+  for (let i = 0; i < names.length; i++) {
+    if (!(names[i] in ObjectPrototype)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isSimpleObject(object): boolean {
+  if (!isObjectPrototype(Object.getPrototypeOf(object))) {
+    return false;
+  }
+  const names = Object.getOwnPropertyNames(object);
+  for (let i = 0; i < names.length; i++) {
+    const descriptor = Object.getOwnPropertyDescriptor(object, names[i]);
+    if (!descriptor) {
+      return false;
+    }
+    if (!descriptor.enumerable) {
+      if (
+        (names[i] === 'key' || names[i] === 'ref') &&
+        typeof descriptor.get === 'function'
+      ) {
+        // React adds key and ref getters to props objects to issue warnings.
+        // Those getters will not be transferred to the client, but that's ok,
+        // so we'll special case them.
+        continue;
+      }
+      return false;
+    }
+  }
+  return true;
+}
+
+function objectName(object): string {
+  const name = Object.prototype.toString.call(object);
+  return name.replace(/^\[object (.*)\]$/, function(m, p0) {
+    return p0;
+  });
+}
+
+function describeKeyForErrorMessage(key: string): string {
+  const encodedKey = JSON.stringify(key);
+  return '"' + key + '"' === encodedKey ? key : encodedKey;
+}
+
+function describeValueForErrorMessage(value: ReactModel): string {
+  switch (typeof value) {
+    case 'string': {
+      return JSON.stringify(
+        value.length <= 10 ? value : value.substr(0, 10) + '...',
+      );
+    }
+    case 'object': {
+      if (isArray(value)) {
+        return '[...]';
+      }
+      const name = objectName(value);
+      if (name === 'Object') {
+        return '{...}';
+      }
+      return name;
+    }
+    case 'function':
+      return 'function';
+    default:
+      // eslint-disable-next-line
+      return String(value);
+  }
+}
+
+function describeObjectForErrorMessage(
+  objectOrArray:
+    | {+[key: string | number]: ReactModel}
+    | $ReadOnlyArray<ReactModel>,
+  expandedName?: string,
+): string {
+  if (isArray(objectOrArray)) {
+    let str = '[';
+    // $FlowFixMe: Should be refined by now.
+    const array: $ReadOnlyArray<ReactModel> = objectOrArray;
+    for (let i = 0; i < array.length; i++) {
+      if (i > 0) {
+        str += ', ';
+      }
+      if (i > 6) {
+        str += '...';
+        break;
+      }
+      const value = array[i];
+      if (
+        '' + i === expandedName &&
+        typeof value === 'object' &&
+        value !== null
+      ) {
+        str += describeObjectForErrorMessage(value);
+      } else {
+        str += describeValueForErrorMessage(value);
+      }
+    }
+    str += ']';
+    return str;
+  } else {
+    let str = '{';
+    // $FlowFixMe: Should be refined by now.
+    const object: {+[key: string | number]: ReactModel} = objectOrArray;
+    const names = Object.keys(object);
+    for (let i = 0; i < names.length; i++) {
+      if (i > 0) {
+        str += ', ';
+      }
+      if (i > 6) {
+        str += '...';
+        break;
+      }
+      const name = names[i];
+      str += describeKeyForErrorMessage(name) + ': ';
+      const value = object[name];
+      if (
+        name === expandedName &&
+        typeof value === 'object' &&
+        value !== null
+      ) {
+        str += describeObjectForErrorMessage(value);
+      } else {
+        str += describeValueForErrorMessage(value);
+      }
+    }
+    str += '}';
+    return str;
+  }
+}
+
 export function resolveModelToJSON(
   request: Request,
+  parent: {+[key: string | number]: ReactModel} | $ReadOnlyArray<ReactModel>,
+  key: string,
   value: ReactModel,
 ): ReactJSONValue {
-  if (typeof value === 'string') {
-    return escapeStringValue(value);
+  if (__DEV__) {
+    // $FlowFixMe
+    const originalValue = parent[key];
+    if (typeof originalValue === 'object' && originalValue !== value) {
+      console.error(
+        'Only plain objects can be passed to client components from server components. ' +
+          'Objects with toJSON methods are not supported. Convert it manually ' +
+          'to a simple value before passing it to props. ' +
+          'Remove %s from these props: %s',
+        describeKeyForErrorMessage(key),
+        describeObjectForErrorMessage(parent),
+      );
+    }
   }
 
-  if (value === REACT_ELEMENT_TYPE) {
-    return '$';
+  // Special Symbols
+  switch (value) {
+    case REACT_ELEMENT_TYPE:
+      return '$';
+    case REACT_SERVER_BLOCK_TYPE:
+      return '@';
+    case REACT_LAZY_TYPE:
+    case REACT_BLOCK_TYPE:
+      invariant(
+        false,
+        'React Blocks (and Lazy Components) are expected to be replaced by a ' +
+          'compiler on the server. Try configuring your compiler set up and avoid ' +
+          'using React.lazy inside of Blocks.',
+      );
   }
 
+  if (parent[0] === REACT_SERVER_BLOCK_TYPE) {
+    // We're currently encoding part of a Block. Look up which key.
+    switch (key) {
+      case '1': {
+        // Module reference
+        const moduleReference: ModuleReference<any> = (value: any);
+        try {
+          const moduleMetaData: ModuleMetaData = resolveModuleMetaData(
+            request.bundlerConfig,
+            moduleReference,
+          );
+          return (moduleMetaData: ReactJSONValue);
+        } catch (x) {
+          request.pendingChunks++;
+          const errorId = request.nextChunkId++;
+          emitErrorChunk(request, errorId, x);
+          return serializeIDRef(errorId);
+        }
+      }
+      case '2': {
+        // Load function
+        const load: () => ReactModel = (value: any);
+        try {
+          // Attempt to resolve the data.
+          return load();
+        } catch (x) {
+          if (
+            typeof x === 'object' &&
+            x !== null &&
+            typeof x.then === 'function'
+          ) {
+            // Something suspended, we'll need to create a new segment and resolve it later.
+            request.pendingChunks++;
+            const newSegment = createSegment(request, load);
+            const ping = newSegment.ping;
+            x.then(ping, ping);
+            return serializeIDRef(newSegment.id);
+          } else {
+            // This load failed, encode the error as a separate row and reference that.
+            request.pendingChunks++;
+            const errorId = request.nextChunkId++;
+            emitErrorChunk(request, errorId, x);
+            return serializeIDRef(errorId);
+          }
+        }
+      }
+      default: {
+        invariant(
+          false,
+          'A server block should never encode any other slots. This is a bug in React.',
+        );
+      }
+    }
+  }
+
+  // Resolve server components.
   while (
     typeof value === 'object' &&
     value !== null &&
     value.$$typeof === REACT_ELEMENT_TYPE
   ) {
-    let element: React$Element<any> = (value: any);
+    // TODO: Concatenate keys of parents onto children.
+    const element: React$Element<any> = (value: any);
     try {
-      value = attemptResolveModelComponent(element);
+      // Attempt to render the server component.
+      value = attemptResolveElement(element);
     } catch (x) {
       if (typeof x === 'object' && x !== null && typeof x.then === 'function') {
         // Something suspended, we'll need to create a new segment and resolve it later.
         request.pendingChunks++;
-        let newSegment = createSegment(request, element);
-        let ping = newSegment.ping;
+        const newSegment = createSegment(request, () => value);
+        const ping = newSegment.ping;
         x.then(ping, ping);
         return serializeIDRef(newSegment.id);
       } else {
-        request.pendingChunks++;
-        let errorId = request.nextChunkId++;
-        emitErrorChunk(request, errorId, x);
-        return serializeIDRef(errorId);
+        // Something errored. Don't bother encoding anything up to here.
+        throw x;
       }
     }
   }
 
-  return value;
+  if (typeof value === 'object') {
+    if (__DEV__) {
+      if (value !== null && !isArray(value)) {
+        // Verify that this is a simple plain object.
+        if (objectName(value) !== 'Object') {
+          console.error(
+            'Only plain objects can be passed to client components from server components. ' +
+              'Built-ins like %s are not supported. ' +
+              'Remove %s from these props: %s',
+            objectName(value),
+            describeKeyForErrorMessage(key),
+            describeObjectForErrorMessage(parent),
+          );
+        } else if (!isSimpleObject(value)) {
+          console.error(
+            'Only plain objects can be passed to client components from server components. ' +
+              'Classes or other objects with methods are not supported. ' +
+              'Remove %s from these props: %s',
+            describeKeyForErrorMessage(key),
+            describeObjectForErrorMessage(parent, key),
+          );
+        } else if (Object.getOwnPropertySymbols) {
+          const symbols = Object.getOwnPropertySymbols(value);
+          if (symbols.length > 0) {
+            console.error(
+              'Only plain objects can be passed to client components from server components. ' +
+                'Objects with symbol properties like %s are not supported. ' +
+                'Remove %s from these props: %s',
+              symbols[0].description,
+              describeKeyForErrorMessage(key),
+              describeObjectForErrorMessage(parent, key),
+            );
+          }
+        }
+      }
+    }
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    return escapeStringValue(value);
+  }
+
+  if (
+    typeof value === 'boolean' ||
+    typeof value === 'number' ||
+    typeof value === 'undefined'
+  ) {
+    return value;
+  }
+
+  if (typeof value === 'function') {
+    if (/^on[A-Z]/.test(key)) {
+      invariant(
+        false,
+        'Event handlers cannot be passed to client component props. ' +
+          'Remove %s from these props if possible: %s\n' +
+          'If you need interactivity, consider converting part of this to a client component.',
+        describeKeyForErrorMessage(key),
+        describeObjectForErrorMessage(parent),
+      );
+    } else {
+      invariant(
+        false,
+        'Functions cannot be passed directly to client components ' +
+          "because they're not serializable. " +
+          'Remove %s (%s) from this object, or avoid the entire object: %s',
+        describeKeyForErrorMessage(key),
+        value.displayName || value.name || 'function',
+        describeObjectForErrorMessage(parent),
+      );
+    }
+  }
+
+  if (typeof value === 'symbol') {
+    invariant(
+      false,
+      'Symbol values (%s) cannot be passed to client components. ' +
+        'Remove %s from this object, or avoid the entire object: %s',
+      value.description,
+      describeKeyForErrorMessage(key),
+      describeObjectForErrorMessage(parent),
+    );
+  }
+
+  // $FlowFixMe: bigint isn't added to Flow yet.
+  if (typeof value === 'bigint') {
+    invariant(
+      false,
+      'BigInt (%s) is not yet supported in client component props. ' +
+        'Remove %s from this object or use a plain number instead: %s',
+      value,
+      describeKeyForErrorMessage(key),
+      describeObjectForErrorMessage(parent),
+    );
+  }
+
+  invariant(
+    false,
+    'Type %s is not supported in client component props. ' +
+      'Remove %s from this object, or avoid the entire object: %s',
+    typeof value,
+    describeKeyForErrorMessage(key),
+    describeObjectForErrorMessage(parent),
+  );
 }
 
 function emitErrorChunk(request: Request, id: number, error: mixed): void {
@@ -193,30 +591,34 @@ function emitErrorChunk(request: Request, id: number, error: mixed): void {
     message = 'An error occurred but serializing the error message failed.';
   }
 
-  let processedChunk = processErrorChunk(request, id, message, stack);
+  const processedChunk = processErrorChunk(request, id, message, stack);
   request.completedErrorChunks.push(processedChunk);
 }
 
 function retrySegment(request: Request, segment: Segment): void {
-  let value = segment.model;
+  const query = segment.query;
+  let value;
   try {
+    value = query();
     while (
       typeof value === 'object' &&
       value !== null &&
       value.$$typeof === REACT_ELEMENT_TYPE
     ) {
-      // If this is a nested model, there's no need to create another chunk,
-      // we can reuse the existing one and try again.
-      let element: React$Element<any> = (value: any);
-      segment.model = element;
-      value = attemptResolveModelComponent(element);
+      // TODO: Concatenate keys of parents onto children.
+      const element: React$Element<any> = (value: any);
+      // Attempt to render the server component.
+      // Doing this here lets us reuse this same segment if the next component
+      // also suspends.
+      segment.query = () => value;
+      value = attemptResolveElement(element);
     }
-    let processedChunk = processModelChunk(request, segment.id, value);
+    const processedChunk = processModelChunk(request, segment.id, value);
     request.completedJSONChunks.push(processedChunk);
   } catch (x) {
     if (typeof x === 'object' && x !== null && typeof x.then === 'function') {
       // Something suspended again, let's pick it back up later.
-      let ping = segment.ping;
+      const ping = segment.ping;
       x.then(ping, ping);
       return;
     } else {
@@ -227,15 +629,20 @@ function retrySegment(request: Request, segment: Segment): void {
 }
 
 function performWork(request: Request): void {
-  let pingedSegments = request.pingedSegments;
+  const prevDispatcher = ReactCurrentDispatcher.current;
+  ReactCurrentDispatcher.current = Dispatcher;
+
+  const pingedSegments = request.pingedSegments;
   request.pingedSegments = [];
   for (let i = 0; i < pingedSegments.length; i++) {
-    let segment = pingedSegments[i];
+    const segment = pingedSegments[i];
     retrySegment(request, segment);
   }
   if (request.flowing) {
     flushCompletedChunks(request);
   }
+
+  ReactCurrentDispatcher.current = prevDispatcher;
 }
 
 let reentrant = false;
@@ -244,14 +651,14 @@ function flushCompletedChunks(request: Request): void {
     return;
   }
   reentrant = true;
-  let destination = request.destination;
+  const destination = request.destination;
   beginWriting(destination);
   try {
-    let jsonChunks = request.completedJSONChunks;
+    const jsonChunks = request.completedJSONChunks;
     let i = 0;
     for (; i < jsonChunks.length; i++) {
       request.pendingChunks--;
-      let chunk = jsonChunks[i];
+      const chunk = jsonChunks[i];
       if (!writeChunk(destination, chunk)) {
         request.flowing = false;
         i++;
@@ -259,11 +666,11 @@ function flushCompletedChunks(request: Request): void {
       }
     }
     jsonChunks.splice(0, i);
-    let errorChunks = request.completedErrorChunks;
+    const errorChunks = request.completedErrorChunks;
     i = 0;
     for (; i < errorChunks.length; i++) {
       request.pendingChunks--;
-      let chunk = errorChunks[i];
+      const chunk = errorChunks[i];
       if (!writeChunk(destination, chunk)) {
         request.flowing = false;
         i++;
@@ -291,3 +698,33 @@ export function startFlowing(request: Request): void {
   request.flowing = true;
   flushCompletedChunks(request);
 }
+
+function unsupportedHook(): void {
+  invariant(false, 'This Hook is not supported in Server Components.');
+}
+
+const Dispatcher: DispatcherType = {
+  useMemo<T>(nextCreate: () => T): T {
+    return nextCreate();
+  },
+  useCallback<T>(callback: T): T {
+    return callback;
+  },
+  useDebugValue(): void {},
+  useDeferredValue<T>(value: T): T {
+    return value;
+  },
+  useTransition(): [(callback: () => void) => void, boolean] {
+    return [() => {}, false];
+  },
+  readContext: (unsupportedHook: any),
+  useContext: (unsupportedHook: any),
+  useReducer: (unsupportedHook: any),
+  useRef: (unsupportedHook: any),
+  useState: (unsupportedHook: any),
+  useLayoutEffect: (unsupportedHook: any),
+  useImperativeHandle: (unsupportedHook: any),
+  useEffect: (unsupportedHook: any),
+  useOpaqueIdentifier: (unsupportedHook: any),
+  useMutableSource: (unsupportedHook: any),
+};

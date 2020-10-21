@@ -24,7 +24,7 @@ function writeConfig(renderer, rendererInfo, isServerSupported) {
 
   const serverRenderer = isServerSupported ? renderer : 'custom';
 
-  let ignoredPaths = [];
+  const ignoredPaths = [];
 
   inlinedHostConfigs.forEach(otherRenderer => {
     if (otherRenderer === rendererInfo) {
@@ -53,6 +53,7 @@ module.name_mapper='ReactServerStreamConfig$$' -> 'forks/ReactServerStreamConfig
 module.name_mapper='ReactServerFormatConfig$$' -> 'forks/ReactServerFormatConfig.${serverRenderer}'
 module.name_mapper='ReactFlightServerConfig$$' -> 'forks/ReactFlightServerConfig.${serverRenderer}'
 module.name_mapper='ReactFlightClientHostConfig$$' -> 'forks/ReactFlightClientHostConfig.${serverRenderer}'
+module.name_mapper='react-devtools-feature-flags' -> 'react-devtools-shared/src/config/DevToolsFeatureFlags.default'
     `.trim(),
     )
     .replace('%REACT_RENDERER_FLOW_IGNORES%', ignoredPaths.join('\n'));
